@@ -322,8 +322,17 @@ class VirtEnv(object):
 
         with LogTask(log_msg), utils.RollbackContext() as rollback:
             with LogTask('Start nets'):
+                dns_records = {}
+                mgmt_nets = []
                 for net in nets:
-                    net.start()
+                    dns_records.update(net.mapping())
+                    if net.is_management():
+                        mgmt_nets.append(net.gw())
+                for net in nets:
+                    if net.is_management():
+                        net.start(dns_records=dns_records)
+                    else:
+                        net.start(mgmt_nets=mgmt_nets)
                     rollback.prependDefer(net.stop)
 
             with LogTask('Start vms'):
@@ -583,7 +592,7 @@ class Network(object):
     def _libvirt_name(self):
         return self._env.prefixed_name(self.name(), max_length=15)
 
-    def _libvirt_xml(self):
+    def _libvirt_xml(self, **kwargs):
         raise NotImplementedError(
             'should be implemented by the specific network class'
         )
@@ -592,7 +601,7 @@ class Network(object):
         net_names = [net.name() for net in self.libvirt_con.listAllNetworks()]
         return self._libvirt_name() in net_names
 
-    def start(self, attempts=5, timeout=2):
+    def start(self, attempts=5, timeout=2, **kwargs):
         """
         Start the network, will check if the network is active ``attempts``
         times, waiting ``timeout`` between each attempt.
@@ -611,7 +620,9 @@ class Network(object):
 
         if not self.alive():
             with LogTask('Create network %s' % self.name()):
-                net = self.libvirt_con.networkCreateXML(self._libvirt_xml())
+                net = self.libvirt_con.networkCreateXML(
+                    self._libvirt_xml(**kwargs)
+                )
                 if net is None:
                     raise RuntimeError(
                         'failed to create network, XML: %s' %
@@ -644,7 +655,7 @@ class Network(object):
 
 
 class NATNetwork(Network):
-    def _libvirt_xml(self):
+    def _libvirt_xml(self, **kwargs):
         with open(_path_to_xml('net_nat_template.xml')) as f:
             net_raw_xml = f.read()
 
@@ -678,6 +689,10 @@ class NATNetwork(Network):
             ipv6 = net_xml.xpath('/network/ip')[1]
             dns = net_xml.xpath('/network/dns')[0]
 
+            if not self.is_management() and kwargs.get('mgmt_nets'):
+                for net in kwargs['mgmt_nets']:
+                    dns.append(lxml.etree.Element('forwarder', addr=net))
+
             def make_ipv4(last):
                 return '.'.join(self.gw().split('.')[:-1] + [str(last)])
 
@@ -701,24 +716,25 @@ class NATNetwork(Network):
                 )
             )
 
-            if self.is_management():
-                for hostname, ip4 in self._spec['mapping'].items():
-                    dhcp.append(
-                        lxml.etree.Element(
-                            'host',
-                            mac=utils.ipv4_to_mac(ip4),
-                            ip=ip4,
-                            name=hostname
-                        )
+            for hostname, ip4 in self._spec['mapping'].items():
+                dhcp.append(
+                    lxml.etree.Element(
+                        'host',
+                        mac=utils.ipv4_to_mac(ip4),
+                        ip=ip4,
+                        name=hostname
                     )
-                    dhcpv6.append(
-                        lxml.etree.Element(
-                            'host',
-                            id='0:3:0:1:' + utils.ipv4_to_mac(ip4),
-                            ip=IPV6_PREFIX + ip4,
-                            name=hostname
-                        )
+                )
+                dhcpv6.append(
+                    lxml.etree.Element(
+                        'host',
+                        id='0:3:0:1:' + utils.ipv4_to_mac(ip4),
+                        ip=IPV6_PREFIX + ip4,
+                        name=hostname
                     )
+                )
+            if self.is_management() and 'dns_records' in kwargs:
+                for hostname, ip4 in kwargs['dns_records'].viewitems():
                     dns_host = lxml.etree.SubElement(dns, 'host', ip=ip4)
                     dns_name = lxml.etree.SubElement(dns_host, 'hostname')
                     dns_name.text = hostname
@@ -729,6 +745,8 @@ class NATNetwork(Network):
                     dns6_name.text = hostname
                     dns.append(dns_host)
                     dns.append(dns6_host)
+
+            print lxml.etree.tostring(net_xml)
 
         return lxml.etree.tostring(net_xml)
 

@@ -303,7 +303,14 @@ class Prefix(object):
     def _add_nic_to_mapping(self, net, dom, nic):
         """
         Populates the given net spec mapping entry with the nicks of the given
-        domain
+        domain.
+
+        Each vm can be connected to only one management network.
+
+        The name of the nic will be "DOMAINNAME-NETWORKNAME", unless '-' is in
+        NETWORKNAME, then the string after the last '-' will be used instead
+        of the full NETWORKNAME.
+
 
         Args:
             net (dict): Network spec to populate
@@ -315,9 +322,31 @@ class Prefix(object):
             None
         """
         dom_name = dom['name']
-        idx = dom['nics'].index(nic)
-        name = idx == 0 and dom_name or '%s-eth%d' % (dom_name, idx)
+
+        if net.get('management'):
+            name = dom_name
+            if name in net['mapping']:
+                raise utils.LagoUserException(
+                    'VM {} was configured with more then one management network.\n '
+                    'Each VM should be connected to only one management network'.
+                    format(dom['name'])
+                )
+        else:
+            name = '{}-{}'.format(dom_name, net['name'].rsplit('-', 1)[-1])
+            if name in net['mapping']:
+                name = self._resolve_duplicate_nic_name(name, net)
+
         net['mapping'][name] = nic['ip']
+
+    @staticmethod
+    def _resolve_duplicate_nic_name(name, net):
+        counter = 2
+        tmp_name = name
+        while tmp_name in net['mapping']:
+            tmp_name = name + '-{}'.format(counter)
+            counter += 1
+
+        return tmp_name
 
     def _register_preallocated_ips(self, conf):
         """
